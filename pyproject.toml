@@ -1,0 +1,16 @@
+[project]
+name = "tfm4atari"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "Eric", email = "ye_jin2004@163.com" }
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+tfm4atari = "tfm4atari:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
