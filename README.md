@@ -67,16 +67,16 @@ commands resume from completed work.
   any success signal (BeamRider reward), `-1` if it contains death/punishment,
   and `0` otherwise. Death/punishment takes precedence. Teacher
   Q-values/probabilities are not used as context labels.
-- Teacher credit uses smaller 16-action windows for precise backward credit;
-  online experience uses 64-action windows. Both capacities are configured in
+- Teacher credit uses 16-action windows, while online experience uses narrower
+  8-action windows. Both capacities are configured in
   `config.toml` and use the same reward/death/neutral symbolic judge.
 - At inference the PFN receives the current state plus requested symbolic label
   `+1`, then predicts the action most associated with that desired outcome.
 - Online PFN episodes never call the teacher. The game-specific relevance
-  filter decides which executed actions enter each 64-action batch by default.
+  filter decides which executed actions enter each 8-action batch by default.
   BeamRider keeps every action because the player is continuously active. The
   pluggable trajectory judge labels the completed batch with one success flag.
-  Every batch is persisted immediately; on CPU the actor is rebuilt after four
+  Every batch is persisted immediately; on CPU the actor is rebuilt after 32
   judged batches (256 decisions) to avoid conflating durable experience capture
   with the much more expensive TabPFN refit cadence.
 - `data/<game>/context_cache_<backend>_<label-schema>.parquet` is strictly a

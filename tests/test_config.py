@@ -11,8 +11,8 @@ def test_default_config_enables_only_beamrider() -> None:
     assert config.active_games[0].teacher_backend == "qrdqn"
     assert len(config.games) == 7
     assert config.context_cache.teacher_judgment_capacity == 16
-    assert config.context_cache.judgment_capacity == 64
-    assert config.context_cache.refit_every_judged_batches == 4
+    assert config.context_cache.judgment_capacity == 8
+    assert config.context_cache.refit_every_judged_batches == 32
     assert config.video.max_decisions == 1024
     assert config.runtime.cpu_context_rows == 4000
     assert config.runtime.cuda_context_rows == 10000

@@ -27,7 +27,7 @@ ACTION_CATEGORICAL_COLUMNS = (
     DESIRED_SYMBOLIC_LABEL,
 )
 ACTION_TARGET_COLUMN = "executed_action"
-SYMBOLIC_LABEL_SCHEMA = "symbolic_teacher_window16_online_window64_v4"
+SYMBOLIC_LABEL_SCHEMA = "symbolic_teacher_window16_online_window8_v5"
 
 
 class RamFeatureExtractor(Protocol):

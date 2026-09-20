@@ -161,14 +161,6 @@ class ProjectConfig(StrictModel):
                 "context_cache.minimum_cold_start_rows must be smaller than "
                 "every hardware context budget"
             )
-        if (
-            self.context_cache.teacher_judgment_capacity
-            >= self.context_cache.judgment_capacity
-        ):
-            raise ValueError(
-                "context_cache.teacher_judgment_capacity must be smaller than "
-                "context_cache.judgment_capacity"
-            )
         return self
 
     @property

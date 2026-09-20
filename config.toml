@@ -52,8 +52,8 @@ maximum_lives_lost = 1
 [context_cache]
 enabled = true
 teacher_judgment_capacity = 16
-judgment_capacity = 64
-refit_every_judged_batches = 4
+judgment_capacity = 8
+refit_every_judged_batches = 32
 maximum_rows = 4000
 minimum_cold_start_rows = 2000
 
