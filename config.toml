@@ -1,0 +1,142 @@
+schema_version = 1
+enabled_games = ["BeamRider"]
+
+[paths]
+data_dir = "data"
+artifact_dir = "artifacts"
+video_dir = "videos"
+
+[runtime]
+device = "auto"
+precision = "auto"
+seed = 42
+render_mode = "none"
+record_video = false
+cpu_context_rows = 4000
+cuda_context_rows = 10000
+n_preprocessing_jobs = 1
+
+[atari]
+frameskip = 1
+repeat_action_probability = 0.0
+wrapper_frame_skip = 4
+noop_max = 30
+screen_size = 84
+terminal_on_life_loss = false
+full_action_space = false
+
+[collection]
+episodes_per_game = 2
+sample_stride = 1
+max_decisions_per_episode = 27000
+maximum_attempts_per_game = 6
+success_quantile = 0.75
+q_epsilon = 1e-6
+
+[learning]
+episodes = 100
+
+[trajectory_judges]
+default = "return_quantile"
+
+[trajectory_judges.games]
+BeamRider = "beamrider_symbolic"
+
+[trajectory_judges.return_quantile]
+success_quantile = 0.50
+
+[trajectory_judges.beamrider_symbolic]
+minimum_score = 44.0
+minimum_positive_reward_events = 1
+minimum_survival_fraction = 0.80
+maximum_lives_lost = 1
+
+[context_cache]
+enabled = true
+refresh_interval = 64
+maximum_rows = 4000
+minimum_cold_start_rows = 2000
+
+[context_cache.beamrider]
+combat_actions = [1, 7, 8]
+keep_positive_reward_actions = true
+keep_life_change_actions = true
+
+[evaluation]
+random_episodes = 10
+teacher_episodes = 10
+final_episodes = 30
+early_window = 20
+late_window = 20
+
+[video]
+seed = 9001
+max_decisions = 256
+fps = 30
+name_prefix = "beamrider-tabpfn"
+persist_context_additions = true
+teacher_max_decisions = 27000
+teacher_name_prefix = "beamrider-teacher"
+
+[tabpfn]
+model_path = "tabpfn-v3.5-20260909.safetensors"
+cache_dir = "artifacts/tabpfn"
+n_estimators = 4
+fit_mode = "fit_with_cache"
+balance_probabilities = true
+
+[[games]]
+name = "BeamRider"
+env_id = "ALE/BeamRider-v5"
+teacher_backend = "qrdqn"
+teacher_repo = "sb3/qrdqn-BeamRiderNoFrameskip-v4"
+teacher_file = "qrdqn-BeamRiderNoFrameskip-v4.zip"
+teacher_revision = "5b9f0bfd6bba49b1b71adbeac0cd0b6b0d9924ff"
+
+[[games]]
+name = "Breakout"
+env_id = "ALE/Breakout-v5"
+teacher_backend = "dqn"
+teacher_repo = "sb3/dqn-BreakoutNoFrameskip-v4"
+teacher_file = "dqn-BreakoutNoFrameskip-v4.zip"
+teacher_revision = "0086849ff5b805121a1adda76989d9ef227ff997"
+
+[[games]]
+name = "Enduro"
+env_id = "ALE/Enduro-v5"
+teacher_backend = "dqn"
+teacher_repo = "sb3/dqn-EnduroNoFrameskip-v4"
+teacher_file = "dqn-EnduroNoFrameskip-v4.zip"
+teacher_revision = "4c27079e654f1006afc4713cae8847c84183bdd9"
+
+[[games]]
+name = "Pong"
+env_id = "ALE/Pong-v5"
+teacher_backend = "dqn"
+teacher_repo = "sb3/dqn-PongNoFrameskip-v4"
+teacher_file = "dqn-PongNoFrameskip-v4.zip"
+teacher_revision = "f1e5c53df3ef4f893466b3da7db98e47218f0357"
+
+[[games]]
+name = "Qbert"
+env_id = "ALE/Qbert-v5"
+teacher_backend = "dqn"
+teacher_repo = "sb3/dqn-QbertNoFrameskip-v4"
+teacher_file = "dqn-QbertNoFrameskip-v4.zip"
+teacher_revision = "efaedc66554e65e8cbf4b3639142230ebd58322e"
+
+[[games]]
+name = "Seaquest"
+env_id = "ALE/Seaquest-v5"
+teacher_backend = "dqn"
+teacher_repo = "sb3/dqn-SeaquestNoFrameskip-v4"
+teacher_file = "dqn-SeaquestNoFrameskip-v4.zip"
+teacher_revision = "4173d060950e4b637c69cbce3cbe8d88285ab028"
+
+[[games]]
+name = "SpaceInvaders"
+env_id = "ALE/SpaceInvaders-v5"
+teacher_backend = "dqn"
+teacher_repo = "sb3/dqn-SpaceInvadersNoFrameskip-v4"
+teacher_file = "dqn-SpaceInvadersNoFrameskip-v4.zip"
+teacher_revision = "422bd55fb883b1db2df5fa7c67b06eef0f0faf4b"
