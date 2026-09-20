@@ -6,9 +6,10 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-QUEUE_ID_COLUMNS = ("online_trajectory_id", "step", "candidate_action")
+QUEUE_ID_COLUMNS = ("online_trajectory_id", "step", "executed_action")
 QUEUE_REQUIRED_COLUMNS = QUEUE_ID_COLUMNS + (
-    "action_success",
+    "symbolic_label",
+    "desired_symbolic_label",
     "label_source",
     "judged_window_id",
 )

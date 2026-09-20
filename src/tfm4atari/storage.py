@@ -12,6 +12,7 @@ from typing import Any
 import pandas as pd
 
 from tfm4atari.config import ProjectConfig
+from tfm4atari.features import SYMBOLIC_LABEL_SCHEMA
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -89,6 +90,7 @@ class DataStore:
                 metadata.get("collection_role") == "cold_start_teacher"
                 and bool(metadata.get("complete_episode"))
                 and metadata.get("teacher", {}).get("backend") == teacher_backend
+                and metadata.get("context_label_schema") == SYMBOLIC_LABEL_SCHEMA
             ):
                 selected.append(trajectory_id)
         return tuple(selected)
@@ -107,7 +109,13 @@ class DataStore:
     def trial_dir(
         self, game: str, teacher_backend: str, phase: str = "learning"
     ) -> Path:
-        return self._game(game) / "learning_trials" / teacher_backend / phase
+        return (
+            self._game(game)
+            / "learning_trials"
+            / teacher_backend
+            / SYMBOLIC_LABEL_SCHEMA
+            / phase
+        )
 
     def write_trial(
         self,
@@ -143,7 +151,9 @@ class DataStore:
         )
 
     def judge_state_path(self, game: str, teacher_backend: str) -> Path:
-        return self._game(game) / f"trajectory_judge_{teacher_backend}.json"
+        return self._game(game) / (
+            f"trajectory_judge_{teacher_backend}_{SYMBOLIC_LABEL_SCHEMA}.json"
+        )
 
     def write_judge_state(
         self, game: str, teacher_backend: str, document: dict[str, Any]
@@ -160,7 +170,9 @@ class DataStore:
             return json.load(handle)
 
     def context_cache_path(self, game: str, teacher_backend: str) -> Path:
-        return self._game(game) / f"context_cache_{teacher_backend}.parquet"
+        return self._game(game) / (
+            f"context_cache_{teacher_backend}_{SYMBOLIC_LABEL_SCHEMA}.parquet"
+        )
 
     def read_context_cache(self, game: str, teacher_backend: str) -> pd.DataFrame:
         path = self.context_cache_path(game, teacher_backend)

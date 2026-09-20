@@ -30,8 +30,6 @@ episodes_per_game = 2
 sample_stride = 1
 max_decisions_per_episode = 27000
 maximum_attempts_per_game = 6
-success_quantile = 0.75
-q_epsilon = 1e-6
 
 [learning]
 episodes = 100
@@ -53,14 +51,13 @@ maximum_lives_lost = 1
 
 [context_cache]
 enabled = true
-refresh_interval = 64
+teacher_judgment_capacity = 16
+judgment_capacity = 64
+refit_every_judged_batches = 4
 maximum_rows = 4000
 minimum_cold_start_rows = 2000
 
 [context_cache.beamrider]
-combat_actions = [1, 7, 8]
-keep_positive_reward_actions = true
-keep_life_change_actions = true
 
 [evaluation]
 random_episodes = 10
@@ -71,7 +68,7 @@ late_window = 20
 
 [video]
 seed = 9001
-max_decisions = 256
+max_decisions = 1024
 fps = 30
 name_prefix = "beamrider-tabpfn"
 persist_context_additions = true
@@ -83,7 +80,7 @@ model_path = "tabpfn-v3.5-20260909.safetensors"
 cache_dir = "artifacts/tabpfn"
 n_estimators = 4
 fit_mode = "fit_with_cache"
-balance_probabilities = true
+balance_probabilities = false
 
 [[games]]
 name = "BeamRider"

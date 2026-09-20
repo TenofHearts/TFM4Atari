@@ -50,8 +50,6 @@ class CollectionConfig(StrictModel):
     sample_stride: int = Field(1, ge=1)
     max_decisions_per_episode: int = Field(27000, ge=1)
     maximum_attempts_per_game: int = Field(6, ge=2)
-    success_quantile: float = Field(0.75, gt=0.0, lt=1.0)
-    q_epsilon: float = Field(1e-6, gt=0.0)
 
 
 class LearningConfig(StrictModel):
@@ -79,14 +77,14 @@ class TrajectoryJudgesConfig(StrictModel):
 
 
 class BeamRiderCacheConfig(StrictModel):
-    combat_actions: tuple[int, ...] = (1, 7, 8)
-    keep_positive_reward_actions: bool = True
-    keep_life_change_actions: bool = True
+    """BeamRider keeps every action; reserved for future game-specific settings."""
 
 
 class ContextCacheConfig(StrictModel):
     enabled: bool = True
-    refresh_interval: int = Field(64, ge=1)
+    teacher_judgment_capacity: int = Field(16, ge=1)
+    judgment_capacity: int = Field(64, ge=1)
+    refit_every_judged_batches: int = Field(4, ge=1)
     maximum_rows: int = Field(4000, ge=2)
     minimum_cold_start_rows: int = Field(2000, ge=2)
     beamrider: BeamRiderCacheConfig
@@ -162,6 +160,14 @@ class ProjectConfig(StrictModel):
             raise ValueError(
                 "context_cache.minimum_cold_start_rows must be smaller than "
                 "every hardware context budget"
+            )
+        if (
+            self.context_cache.teacher_judgment_capacity
+            >= self.context_cache.judgment_capacity
+        ):
+            raise ValueError(
+                "context_cache.teacher_judgment_capacity must be smaller than "
+                "context_cache.judgment_capacity"
             )
         return self
 

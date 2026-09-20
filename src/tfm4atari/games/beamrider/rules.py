@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from tfm4atari.config import (
@@ -70,20 +71,28 @@ class BeamRiderSymbolicJudge:
 
 @dataclass(frozen=True)
 class BeamRiderRelevanceFilter:
-    """Keep only executed actions with direct BeamRider relevance."""
+    """Keep every PFN action because BeamRider is continuously active."""
 
     config: BeamRiderCacheConfig
-    name: str = "beamrider_combat"
-    version: int = 1
+    name: str = "beamrider_all_actions"
+    version: int = 2
 
     def filter(self, executed_actions: pd.DataFrame) -> pd.DataFrame:
-        if executed_actions.empty:
-            return executed_actions.copy()
-        relevant = executed_actions["candidate_action"].isin(self.config.combat_actions)
-        if self.config.keep_positive_reward_actions:
-            relevant |= executed_actions["observed_reward"] > 0
-        if self.config.keep_life_change_actions:
-            relevant |= (
-                executed_actions["lives_before"] != executed_actions["lives_after"]
-            )
-        return executed_actions.loc[relevant].copy()
+        _ = self.config
+        return executed_actions.copy()
+
+
+def label_beamrider_interval(actions: pd.DataFrame) -> pd.DataFrame:
+    """Apply one symbolic label to a completed relevant-action interval."""
+    labeled = actions.copy()
+    if labeled.empty:
+        labeled["symbolic_label"] = pd.Series(dtype="int8")
+        return labeled
+    if (labeled["lives_after"] < labeled["lives_before"]).any():
+        label = -1
+    elif (labeled["observed_reward"] > 0).any():
+        label = 1
+    else:
+        label = 0
+    labeled["symbolic_label"] = np.int8(label)
+    return labeled

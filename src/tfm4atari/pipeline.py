@@ -25,9 +25,12 @@ from tfm4atari.environment import (
 )
 from tfm4atari.features import (
     ACTION_FEATURE_COLUMNS,
+    ACTION_TARGET_COLUMN,
+    DESIRED_SYMBOLIC_LABEL,
+    SYMBOLIC_LABEL_SCHEMA,
     DefaultRamFeatureExtractor,
-    make_action_rows,
 )
+from tfm4atari.games.beamrider import label_beamrider_interval
 from tfm4atari.games.registry import game_module
 from tfm4atari.judges import (
     Judgment,
@@ -155,6 +158,39 @@ def _cold_start_context(
     return pd.concat(frames, ignore_index=True), ids
 
 
+def _label_symbolic_interval(
+    config: ProjectConfig, game: GameConfig, actions: pd.DataFrame
+) -> pd.DataFrame:
+    """Label one completed relevant-action interval without teacher values."""
+    if game.name == "BeamRider":
+        labeled = label_beamrider_interval(actions)
+    else:
+        labeled = actions.copy()
+        label = (
+            -1
+            if (labeled["lives_after"] < labeled["lives_before"]).any()
+            else (1 if (labeled["observed_reward"] > 0).any() else 0)
+        )
+        labeled["symbolic_label"] = np.int8(label)
+    labeled[DESIRED_SYMBOLIC_LABEL] = labeled["symbolic_label"].astype("int8")
+    labeled["label_source"] = "symbolic_action_judge"
+    return labeled
+
+
+def _label_teacher_symbolic_batches(
+    config: ProjectConfig, game: GameConfig, actions: pd.DataFrame
+) -> pd.DataFrame:
+    """Label every teacher action in fixed-size intervals without filtering."""
+    if actions.empty:
+        return actions.copy()
+    capacity = config.context_cache.teacher_judgment_capacity
+    batches = [
+        _label_symbolic_interval(config, game, actions.iloc[start : start + capacity])
+        for start in range(0, len(actions), capacity)
+    ]
+    return pd.concat(batches, ignore_index=True)
+
+
 def collect(
     config: ProjectConfig,
     *,
@@ -177,6 +213,10 @@ def collect(
             .get("teacher", {})
             .get("backend")
             == game.teacher_backend
+            and store.episode_metadata(game.name, trajectory_id).get(
+                "context_label_schema"
+            )
+            == SYMBOLIC_LABEL_SCHEMA
         ]
         completed = [
             trajectory_id
@@ -211,36 +251,37 @@ def collect(
                 and decisions < config.collection.max_decisions_per_episode
             ):
                 ram = current_ram(env)
-                q_values = teacher.action_scores(observation)
-                if q_values.shape != (action_count,):
+                teacher_action = teacher.predict(observation)
+                if not 0 <= teacher_action < action_count:
                     env.close()
                     raise ValueError(
-                        f"{game.name} teacher emits {q_values.shape}, expected "
-                        f"{action_count} actions"
+                        f"{game.name} teacher emitted invalid action {teacher_action}"
                     )
-                teacher_action = int(np.argmax(q_values))
-                if decisions % config.collection.sample_stride == 0:
-                    rows = make_action_rows(
-                        extractor,
-                        ram,
-                        previous_ram,
-                        q_values,
-                        previous_action=previous_action,
-                        previous_reward=previous_reward,
-                        lives=current_lives(env),
-                        episode_progress=(
-                            decisions / config.collection.max_decisions_per_episode
-                        ),
-                        success_quantile=config.collection.success_quantile,
-                        q_epsilon=config.collection.q_epsilon,
-                    )
-                    if not rows.empty:
-                        rows.insert(0, "game", game.name)
-                        rows.insert(1, "trajectory_id", trajectory_id)
-                        rows.insert(2, "step", decisions)
-                        rows.insert(3, "teacher_action", teacher_action)
-                        frames.append(rows)
+                lives_before = current_lives(env)
+                row = extractor.state_features(
+                    ram,
+                    previous_ram,
+                    previous_action=previous_action,
+                    previous_reward=previous_reward,
+                    lives=lives_before,
+                    episode_progress=(
+                        decisions / config.collection.max_decisions_per_episode
+                    ),
+                    desired_symbolic_label=0,
+                )
                 observation, reward, terminated, truncated, _ = env.step(teacher_action)
+                frames.append(
+                    {
+                        **row,
+                        "game": game.name,
+                        "trajectory_id": trajectory_id,
+                        "step": decisions,
+                        ACTION_TARGET_COLUMN: teacher_action,
+                        "observed_reward": float(reward),
+                        "lives_before": lives_before,
+                        "lives_after": current_lives(env),
+                    }
+                )
                 episode_return += float(reward)
                 positive_reward_events += int(reward > 0)
                 previous_ram = ram
@@ -250,8 +291,10 @@ def collect(
             final_lives = current_lives(env)
             env.close()
             if not frames:
-                raise RuntimeError(f"No informative Q-value rows for {game.name}")
-            episode = pd.concat(frames, ignore_index=True)
+                raise RuntimeError(f"No relevant symbolic rows for {game.name}")
+            episode = _label_teacher_symbolic_batches(
+                config, game, pd.DataFrame(frames)
+            )
             complete_episode = bool(terminated or truncated)
             store.write_episode(
                 game.name,
@@ -266,6 +309,7 @@ def collect(
                     "complete_episode": complete_episode,
                     "decision_limit": config.collection.max_decisions_per_episode,
                     "sample_stride": config.collection.sample_stride,
+                    "context_label_schema": SYMBOLIC_LABEL_SCHEMA,
                     "episode_return": episode_return,
                     "episode_length": decisions,
                     "initial_lives": initial_lives,
@@ -358,10 +402,8 @@ def _run_actor(
     terminated = truncated = False
     action_count = int(env.action_space.n)  # type: ignore[attr-defined]
     online_trajectory_id = str(uuid.uuid4())
-    window_rows: list[dict[str, Any]] = []
-    window_return = 0.0
-    window_positive_rewards = 0
-    window_initial_lives = initial_lives
+    pending_rows: list[dict[str, Any]] = []
+    judged_batches = 0
 
     adaptive = (
         all(
@@ -378,58 +420,38 @@ def _run_actor(
         and config.context_cache.enabled
     )
 
-    def flush_window(*, final: bool) -> None:
-        nonlocal actor, window_rows, window_return
-        nonlocal window_positive_rewards, window_initial_lives
-        if not adaptive or not window_rows:
+    def flush_context(*, refit_actor: bool) -> None:
+        nonlocal actor, judged_batches
+        if not adaptive or not pending_rows:
             return
-        executed = pd.DataFrame(window_rows)
-        # Filtering is deliberately first: being in a judged window alone does
-        # not make an action eligible for the context queue.
-        relevant = relevance_filter.filter(executed)
-        outcome = TrajectoryOutcome(
-            game=game.name,
-            episode_return=window_return,
-            decisions=len(window_rows),
-            decision_limit=config.context_cache.refresh_interval,
-            initial_lives=window_initial_lives,
-            final_lives=int(window_rows[-1]["lives_after"]),
-            positive_reward_events=window_positive_rewards,
-            terminated=terminated if final else False,
-            truncated=truncated if final else False,
-        )
-        judgment = judge.judge(outcome, judge_state)
-        if not relevant.empty:
-            relevant = relevant.assign(
-                action_success=judgment.success,
-                label_source=(f"trajectory_judge:{judgment.judge}:v{judgment.version}"),
+        labeled = _label_symbolic_interval(config, game, pd.DataFrame(pending_rows))
+        if not labeled.empty:
+            labeled = labeled.assign(
+                label_source="symbolic_action_judge",
                 judged_window_id=(
-                    f"{online_trajectory_id}:{window_rows[0]['step']}-"
-                    f"{window_rows[-1]['step']}"
+                    f"{online_trajectory_id}:{pending_rows[0]['step']}-"
+                    f"{pending_rows[-1]['step']}"
                 ),
-                trajectory_score=judgment.score,
-                judge_name=judgment.judge,
-                judge_version=judgment.version,
-                judge_reasons=json.dumps(judgment.reasons),
-                judge_metrics=json.dumps(judgment.metrics, sort_keys=True),
                 relevance_filter=relevance_filter.name,
                 relevance_filter_version=relevance_filter.version,
             )
-            queue.add(relevant)
+            queue.add(labeled)
+            judged_batches += 1
             if persist_queue is not None:
                 persist_queue(queue.rows)
-            actor = Actor.fit(
-                factory,
-                base_context,
-                budget=context_budget(config),
-                seed=config.runtime.seed,
-                additions=queue.rows,
-                minimum_base_rows=config.context_cache.minimum_cold_start_rows,
+            refit_due = (
+                judged_batches % config.context_cache.refit_every_judged_batches == 0
             )
-        window_rows = []
-        window_return = 0.0
-        window_positive_rewards = 0
-        window_initial_lives = int(outcome.final_lives)
+            if refit_actor and refit_due:
+                actor = Actor.fit(
+                    factory,
+                    base_context,
+                    budget=context_budget(config),
+                    seed=config.runtime.seed,
+                    additions=queue.rows,
+                    minimum_base_rows=config.context_cache.minimum_cold_start_rows,
+                )
+        pending_rows.clear()
 
     while not (terminated or truncated) and decisions < limit:
         ram = current_ram(env)
@@ -443,41 +465,41 @@ def _run_actor(
             lives=current_lives(env),
             episode_progress=decisions / limit,
         )
-        executed_features = actor.extractor.action_features(
+        executed_features = actor.extractor.state_features(
             ram,
             previous_ram,
             previous_action=previous_action,
-            candidate_action=action,
             previous_reward=previous_reward,
             lives=lives_before,
             episode_progress=decisions / limit,
+            desired_symbolic_label=0,
         )
         _, reward, terminated, truncated, _ = env.step(action)
         lives_after = current_lives(env)
         total += float(reward)
         positive_reward_events += int(reward > 0)
-        window_return += float(reward)
-        window_positive_rewards += int(reward > 0)
-        window_rows.append(
-            {
-                **executed_features,
-                "game": game.name,
-                "online_trajectory_id": online_trajectory_id,
-                "step": decisions,
-                "observed_reward": float(reward),
-                "lives_before": lives_before,
-                "lives_after": lives_after,
-            }
-        )
+        executed = {
+            **executed_features,
+            "game": game.name,
+            "online_trajectory_id": online_trajectory_id,
+            "step": decisions,
+            ACTION_TARGET_COLUMN: action,
+            "observed_reward": float(reward),
+            "lives_before": lives_before,
+            "lives_after": lives_after,
+        }
+        if not relevance_filter.filter(pd.DataFrame([executed])).empty:
+            pending_rows.append(executed)
         previous_ram = ram
         previous_action = action
         previous_reward = float(reward)
         decisions += 1
-        boundary = decisions % config.context_cache.refresh_interval == 0
-        if adaptive and (boundary or terminated or truncated):
-            flush_window(final=terminated or truncated)
-    if adaptive and window_rows:
-        flush_window(final=True)
+        capacity_full = len(pending_rows) >= config.context_cache.judgment_capacity
+        if adaptive and (capacity_full or terminated or truncated):
+            has_future_action = not (terminated or truncated) and decisions < limit
+            flush_context(refit_actor=has_future_action)
+    if adaptive and pending_rows:
+        flush_context(refit_actor=False)
     final_lives = current_lives(env)
     env.close()
     return EpisodeResult(

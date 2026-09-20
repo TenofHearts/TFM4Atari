@@ -13,6 +13,8 @@ from tfm4atari.config import ProjectConfig
 from tfm4atari.features import (
     ACTION_CATEGORICAL_COLUMNS,
     ACTION_FEATURE_COLUMNS,
+    ACTION_TARGET_COLUMN,
+    DESIRED_SYMBOLIC_LABEL,
     DefaultRamFeatureExtractor,
 )
 
@@ -73,28 +75,56 @@ class TabPFNFactory:
 
 
 def stratified_context(rows: pd.DataFrame, budget: int, *, seed: int) -> pd.DataFrame:
-    """Deterministically preserve action/label coverage under the context cap."""
-    ordered = rows.sort_values(["step", "candidate_action"]).reset_index(drop=True)
+    """Sample context proportionally while preserving every observed stratum."""
+    ordered = rows.sort_values(["step", ACTION_TARGET_COLUMN]).reset_index(drop=True)
     if len(ordered) <= budget:
         return ordered
-    group_columns = ["candidate_action", "action_success"]
-    if "trajectory_id" in ordered:
-        group_columns.insert(0, "trajectory_id")
-    groups = list(ordered.groupby(group_columns, sort=True))
-    allocation = max(1, budget // len(groups))
+    trajectory_columns = ["trajectory_id"] if "trajectory_id" in ordered else []
+    candidates = (
+        trajectory_columns + [DESIRED_SYMBOLIC_LABEL, ACTION_TARGET_COLUMN],
+        trajectory_columns + [DESIRED_SYMBOLIC_LABEL],
+        trajectory_columns,
+    )
+    groups: list[tuple[Any, pd.DataFrame]] = [("all", ordered)]
+    for group_columns in candidates:
+        if not group_columns:
+            continue
+        candidate_groups = list(ordered.groupby(group_columns, sort=True))
+        if len(candidate_groups) <= budget:
+            groups = candidate_groups
+            break
+
+    sizes = np.asarray([len(group) for _, group in groups], dtype=np.int64)
+    quotas = budget * sizes / sizes.sum()
+    allocations = np.minimum(np.floor(quotas).astype(np.int64), sizes)
+    allocations[allocations == 0] = 1
+    difference = budget - int(allocations.sum())
+    fractions = quotas - np.floor(quotas)
+    if difference > 0:
+        order = np.argsort(-fractions, kind="stable")
+        while difference:
+            for index in order:
+                if allocations[index] < sizes[index]:
+                    allocations[index] += 1
+                    difference -= 1
+                    if difference == 0:
+                        break
+    elif difference < 0:
+        excess = allocations - quotas
+        order = np.argsort(-excess, kind="stable")
+        while difference:
+            for index in order:
+                if allocations[index] > 1:
+                    allocations[index] -= 1
+                    difference += 1
+                    if difference == 0:
+                        break
+
     selected = [
-        group.sample(min(len(group), allocation), random_state=seed)
-        for _, group in groups
+        group.sample(int(count), random_state=seed)
+        for (_, group), count in zip(groups, allocations, strict=True)
     ]
-    context = pd.concat(selected).drop_duplicates()
-    remaining = budget - len(context)
-    if remaining > 0:
-        pool = ordered.drop(index=context.index, errors="ignore")
-        if not pool.empty:
-            context = pd.concat(
-                [context, pool.sample(min(remaining, len(pool)), random_state=seed)]
-            )
-    return context.head(budget).sort_values(["step", "candidate_action"])
+    return pd.concat(selected).sort_values(["step", ACTION_TARGET_COLUMN])
 
 
 @dataclass
@@ -126,10 +156,12 @@ class Actor:
             context = pd.concat(
                 [retained_base, retained_additions], ignore_index=True, sort=False
             )
-        if context["action_success"].nunique() < 2:
-            raise ValueError("Actor context must contain successful and failed actions")
+        if context[ACTION_TARGET_COLUMN].nunique() < 2:
+            raise ValueError("Actor context must contain at least two actions")
         classifier = factory.classifier(ACTION_CATEGORICAL_COLUMNS)
-        classifier.fit(context[list(ACTION_FEATURE_COLUMNS)], context["action_success"])
+        classifier.fit(
+            context[list(ACTION_FEATURE_COLUMNS)], context[ACTION_TARGET_COLUMN]
+        )
         return cls(classifier=classifier, extractor=DefaultRamFeatureExtractor())
 
     def choose_action(
@@ -143,21 +175,20 @@ class Actor:
         lives: int,
         episode_progress: float,
     ) -> int:
-        rows = [
-            self.extractor.action_features(
-                ram,
-                previous_ram,
-                previous_action=previous_action,
-                candidate_action=action,
-                previous_reward=previous_reward,
-                lives=lives,
-                episode_progress=episode_progress,
-            )
-            for action in range(action_count)
-        ]
-        probabilities = self.classifier.predict_proba(
-            pd.DataFrame(rows)[list(ACTION_FEATURE_COLUMNS)]
+        row = self.extractor.state_features(
+            ram,
+            previous_ram,
+            previous_action=previous_action,
+            previous_reward=previous_reward,
+            lives=lives,
+            episode_progress=episode_progress,
+            desired_symbolic_label=1,
         )
-        classes = list(self.classifier.classes_)
-        positive_index = classes.index(True) if True in classes else classes.index(1)
-        return int(np.argmax(probabilities[:, positive_index]))
+        probabilities = self.classifier.predict_proba(
+            pd.DataFrame([row])[list(ACTION_FEATURE_COLUMNS)]
+        )
+        classes = np.asarray(self.classifier.classes_, dtype=np.int64)
+        valid = (classes >= 0) & (classes < action_count)
+        if not valid.any():
+            raise ValueError("Actor classifier has no valid Atari actions")
+        return int(classes[valid][np.argmax(probabilities[0, valid])])
