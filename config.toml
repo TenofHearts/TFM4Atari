@@ -33,6 +33,10 @@ maximum_attempts_per_game = 6
 
 [learning]
 episodes = 100
+policy_mode = "outcome_conditioned"
+desired_symbolic_label = 1
+action_selection = "probability_sample"
+epsilon_sample_probability = 0.30
 
 [trajectory_judges]
 default = "return_quantile"
@@ -72,6 +76,8 @@ max_decisions = 1024
 fps = 30
 name_prefix = "beamrider-tabpfn"
 persist_context_additions = true
+learning_episodes = 10
+retain_learning_episode_videos = true
 teacher_max_decisions = 27000
 teacher_name_prefix = "beamrider-teacher"
 

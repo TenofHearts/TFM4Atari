@@ -7,7 +7,10 @@ from tfm4atari.games.beamrider import (
     BeamRiderRelevanceFilter,
     label_beamrider_interval,
 )
-from tfm4atari.pipeline import _label_teacher_symbolic_batches
+from tfm4atari.pipeline import (
+    _label_symbolic_interval,
+    _label_teacher_symbolic_rolling,
+)
 
 
 def _rows() -> pd.DataFrame:
@@ -37,15 +40,15 @@ def test_beamrider_filter_keeps_every_executed_action() -> None:
     assert queue.rows["step"].tolist() == [0, 1, 2, 3]
 
 
-def test_teacher_symbolic_batches_keep_every_action() -> None:
+def test_teacher_symbolic_rolling_keeps_every_action() -> None:
     config = load_config()
     game = config.active_games[0]
-    labeled = _label_teacher_symbolic_batches(config, game, _rows())
+    labeled = _label_teacher_symbolic_rolling(config, game, _rows())
     assert labeled["step"].tolist() == [0, 1, 2, 3]
     assert len(labeled) == len(_rows())
 
 
-def test_teacher_uses_smaller_fixed_credit_windows() -> None:
+def test_teacher_uses_overlapping_forward_credit_windows() -> None:
     config = load_config()
     config = config.model_copy(
         update={
@@ -55,10 +58,30 @@ def test_teacher_uses_smaller_fixed_credit_windows() -> None:
         }
     )
     rows = _rows()
-    rows["observed_reward"] = [0.0, 44.0, 0.0, 0.0]
+    rows["observed_reward"] = [0.0, 0.0, 44.0, 0.0]
     rows["lives_after"] = rows["lives_before"]
-    labeled = _label_teacher_symbolic_batches(config, config.active_games[0], rows)
-    assert labeled["symbolic_label"].tolist() == [1, 1, 0, 0]
+    labeled = _label_teacher_symbolic_rolling(config, config.active_games[0], rows)
+    assert labeled["symbolic_label"].tolist() == [0, 1, 1, 0]
+    assert labeled["rolling_window_end_step"].tolist() == [1, 2, 3, 3]
+    assert labeled["rolling_window_size"].tolist() == [2, 2, 2, 1]
+
+
+def test_rolling_labels_exactly_reuse_interval_label_semantics() -> None:
+    config = load_config()
+    game = config.active_games[0]
+    rows = pd.concat([_rows()] * 5, ignore_index=True)
+    rows["step"] = range(len(rows))
+    rolling = _label_teacher_symbolic_rolling(config, game, rows)
+    capacity = config.context_cache.teacher_judgment_capacity
+    expected = [
+        int(
+            _label_symbolic_interval(
+                config, game, rows.iloc[start : start + capacity]
+            )["symbolic_label"].iloc[0]
+        )
+        for start in range(len(rows))
+    ]
+    assert rolling["symbolic_label"].tolist() == expected
 
 
 def test_context_queue_is_fifo_and_deduplicates_executed_actions() -> None:

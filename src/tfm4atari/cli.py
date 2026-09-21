@@ -16,6 +16,7 @@ from tfm4atari.pipeline import (
     play,
     preflight,
     prepare_tabpfn,
+    record_learning_video,
     record_teacher_video,
     record_video,
     run_pipeline,
@@ -30,6 +31,7 @@ COMMANDS: dict[str, Callable[[ProjectConfig], Any]] = {
     "play": play,
     "evaluate": evaluate,
     "record-video": record_video,
+    "record-learning-video": record_learning_video,
     "record-teacher-video": record_teacher_video,
     "pipeline": run_pipeline,
 }

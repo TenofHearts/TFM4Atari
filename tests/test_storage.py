@@ -52,7 +52,19 @@ def test_mutable_learning_artifacts_are_namespaced_by_label_schema(tmp_path) -> 
     )
     store = DataStore(config)
     assert SYMBOLIC_LABEL_SCHEMA in str(store.context_cache_path("BeamRider", "qrdqn"))
+    assert config.learning.policy_mode in str(
+        store.context_cache_path("BeamRider", "qrdqn")
+    )
+    assert config.learning.action_selection in str(
+        store.context_cache_path("BeamRider", "qrdqn")
+    )
     assert SYMBOLIC_LABEL_SCHEMA in str(
+        store.trial_dir("BeamRider", "qrdqn", "learning")
+    )
+    assert config.learning.policy_mode in str(
+        store.trial_dir("BeamRider", "qrdqn", "learning")
+    )
+    assert config.learning.action_selection in str(
         store.trial_dir("BeamRider", "qrdqn", "learning")
     )
     assert SYMBOLIC_LABEL_SCHEMA in str(store.judge_state_path("BeamRider", "qrdqn"))

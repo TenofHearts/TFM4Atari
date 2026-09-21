@@ -44,6 +44,10 @@ class DataStore:
     def __init__(self, config: ProjectConfig) -> None:
         self.root = config.path(config.paths.data_dir)
         self.schema_version = config.schema_version
+        self.policy_mode = config.learning.policy_mode
+        self.policy_namespace = (
+            f"{config.learning.policy_mode}_{config.learning.action_selection}"
+        )
 
     def _game(self, game: str) -> Path:
         return self.root / game
@@ -114,6 +118,7 @@ class DataStore:
             / "learning_trials"
             / teacher_backend
             / SYMBOLIC_LABEL_SCHEMA
+            / self.policy_namespace
             / phase
         )
 
@@ -171,7 +176,8 @@ class DataStore:
 
     def context_cache_path(self, game: str, teacher_backend: str) -> Path:
         return self._game(game) / (
-            f"context_cache_{teacher_backend}_{SYMBOLIC_LABEL_SCHEMA}.parquet"
+            f"context_cache_{teacher_backend}_{SYMBOLIC_LABEL_SCHEMA}_"
+            f"{self.policy_namespace}.parquet"
         )
 
     def read_context_cache(self, game: str, teacher_backend: str) -> pd.DataFrame:

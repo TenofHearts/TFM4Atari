@@ -54,6 +54,14 @@ class CollectionConfig(StrictModel):
 
 class LearningConfig(StrictModel):
     episodes: int = Field(100, ge=1)
+    policy_mode: Literal["behavior_cloning", "outcome_conditioned"] = (
+        "outcome_conditioned"
+    )
+    desired_symbolic_label: Literal[-1, 0, 1] = 1
+    action_selection: Literal[
+        "greedy", "probability_sample", "epsilon_sample"
+    ] = "probability_sample"
+    epsilon_sample_probability: float = Field(0.30, ge=0.0, le=1.0)
 
 
 class ReturnQuantileJudgeConfig(StrictModel):
@@ -104,6 +112,8 @@ class VideoConfig(StrictModel):
     fps: int = Field(30, ge=1)
     name_prefix: str = "beamrider-tabpfn"
     persist_context_additions: bool = True
+    learning_episodes: int = Field(10, ge=1)
+    retain_learning_episode_videos: bool = True
     teacher_max_decisions: int = Field(27000, ge=1)
     teacher_name_prefix: str = "beamrider-teacher"
 

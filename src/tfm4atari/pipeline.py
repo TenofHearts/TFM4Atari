@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import os
 import platform
+import shutil
+import subprocess
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -24,11 +28,11 @@ from tfm4atari.environment import (
     current_ram,
 )
 from tfm4atari.features import (
-    ACTION_FEATURE_COLUMNS,
     ACTION_TARGET_COLUMN,
     DESIRED_SYMBOLIC_LABEL,
     SYMBOLIC_LABEL_SCHEMA,
     DefaultRamFeatureExtractor,
+    actor_feature_columns,
 )
 from tfm4atari.games.beamrider import label_beamrider_interval
 from tfm4atari.games.registry import game_module
@@ -84,11 +88,15 @@ def preflight(config: ProjectConfig) -> dict[str, Any]:
         "cuda_available": torch.cuda.is_available(),
         "context_budget": context_budget(config),
         "tabpfn_cache": str(config.path(config.tabpfn.cache_dir)),
-        "action_feature_count": len(ACTION_FEATURE_COLUMNS),
+        "policy_mode": config.learning.policy_mode,
+        "action_selection": config.learning.action_selection,
+        "action_feature_count": len(
+            actor_feature_columns(config.learning.policy_mode)
+        ),
         "versions": _versions(),
         "games": {},
     }
-    if len(ACTION_FEATURE_COLUMNS) > 500:
+    if len(actor_feature_columns(config.learning.policy_mode)) > 500:
         report["ok"] = False
         report["feature_error"] = "Conservative 500-feature limit exceeded"
     for game in config.active_games:
@@ -125,7 +133,8 @@ def fetch_teachers(config: ProjectConfig) -> dict[str, str]:
 
 def prepare_tabpfn(config: ProjectConfig) -> dict[str, Any]:
     """Download/license-check TabPFN 3.5 and execute a tiny real inference."""
-    classifier = TabPFNFactory(config).classifier()
+    feature_columns = ("feature_a", "feature_b")
+    classifier = TabPFNFactory(config).classifier(feature_columns)
     x = pd.DataFrame({"feature_a": [0.0, 0.2, 0.8, 1.0], "feature_b": [1, 1, 0, 0]})
     y = pd.Series([False, False, True, True], name="success")
     classifier.fit(x, y)
@@ -177,18 +186,44 @@ def _label_symbolic_interval(
     return labeled
 
 
-def _label_teacher_symbolic_batches(
+def _label_teacher_symbolic_rolling(
     config: ProjectConfig, game: GameConfig, actions: pd.DataFrame
 ) -> pd.DataFrame:
-    """Label every teacher action in fixed-size intervals without filtering."""
+    """Label each teacher action from its overlapping forward outcome window."""
     if actions.empty:
         return actions.copy()
     capacity = config.context_cache.teacher_judgment_capacity
-    batches = [
-        _label_symbolic_interval(config, game, actions.iloc[start : start + capacity])
-        for start in range(0, len(actions), capacity)
-    ]
-    return pd.concat(batches, ignore_index=True)
+    # This is the vectorized equivalent of applying the existing interval
+    # labeler to actions.iloc[start:start + capacity] and retaining its first
+    # row. It deliberately preserves death precedence and the exact binary
+    # reward/life-loss signals used by online cache batches.
+    rewards = (actions["observed_reward"].to_numpy() > 0).astype(np.int64)
+    deaths = (
+        actions["lives_after"].to_numpy()
+        < actions["lives_before"].to_numpy()
+    ).astype(np.int64)
+
+    def future_counts(values: np.ndarray) -> np.ndarray:
+        padded = np.pad(values, (0, capacity), constant_values=0)
+        cumulative = np.concatenate(([0], np.cumsum(padded, dtype=np.int64)))
+        starts = np.arange(len(values))
+        return cumulative[starts + capacity] - cumulative[starts]
+
+    reward_ahead = future_counts(rewards) > 0
+    death_ahead = future_counts(deaths) > 0
+    labels = np.where(death_ahead, -1, np.where(reward_ahead, 1, 0)).astype(
+        np.int8
+    )
+    sizes = np.minimum(capacity, len(actions) - np.arange(len(actions)))
+    labeled = actions.copy().reset_index(drop=True)
+    labeled["symbolic_label"] = labels
+    labeled[DESIRED_SYMBOLIC_LABEL] = labels
+    labeled["label_source"] = "symbolic_action_judge_rolling"
+    labeled["rolling_window_end_step"] = (
+        labeled["step"].to_numpy()[np.arange(len(labeled)) + sizes - 1]
+    )
+    labeled["rolling_window_size"] = sizes
+    return labeled
 
 
 def collect(
@@ -292,7 +327,7 @@ def collect(
             env.close()
             if not frames:
                 raise RuntimeError(f"No relevant symbolic rows for {game.name}")
-            episode = _label_teacher_symbolic_batches(
+            episode = _label_teacher_symbolic_rolling(
                 config, game, pd.DataFrame(frames)
             )
             complete_episode = bool(terminated or truncated)
@@ -387,6 +422,7 @@ def _run_actor(
 ) -> EpisodeResult:
     env = environment or build_env(game.env_id, config.atari, config.runtime)
     limit = decision_limit or config.collection.max_decisions_per_episode
+    actor.rng = np.random.default_rng(seed)
     observation, _ = env.reset(seed=seed)
     del observation
     initial = current_ram(env)
@@ -488,7 +524,7 @@ def _run_actor(
             "lives_before": lives_before,
             "lives_after": lives_after,
         }
-        if not relevance_filter.filter(pd.DataFrame([executed])).empty:
+        if adaptive and not relevance_filter.filter(pd.DataFrame([executed])).empty:
             pending_rows.append(executed)
         previous_ram = ram
         previous_action = action
@@ -588,15 +624,30 @@ def play(config: ProjectConfig) -> dict[str, int]:
         )
         judge, judge_state = _judge_for_game(config, store, game)
         module = game_module(config, game.name)
-        queue = ContextQueue(
-            config.context_cache.maximum_rows,
+        stored_context = (
             store.read_context_cache(game.name, game.teacher_backend).tail(
                 config.context_cache.maximum_rows
-            ),
+            )
+            if config.context_cache.enabled
+            else pd.DataFrame()
+        )
+        queue = ContextQueue(
+            config.context_cache.maximum_rows,
+            stored_context,
+        )
+        frozen_actor = (
+            Actor.fit(
+                factory,
+                base_context,
+                budget=context_budget(config),
+                seed=config.runtime.seed,
+            )
+            if not config.context_cache.enabled
+            else None
         )
         for episode_index in range(existing, config.learning.episodes):
             seed = config.runtime.seed + 200_000 + episode_index
-            actor = Actor.fit(
+            actor = frozen_actor or Actor.fit(
                 factory,
                 base_context,
                 budget=context_budget(config),
@@ -615,8 +666,10 @@ def play(config: ProjectConfig) -> dict[str, int]:
                 judge=judge,
                 judge_state=judge_state,
                 relevance_filter=module.relevance_filter,
-                persist_queue=lambda rows, game_name=game.name, backend=game.teacher_backend: (
-                    store.write_context_cache(game_name, backend, rows)
+                persist_queue=lambda rows,
+                game_name=game.name,
+                backend=game.teacher_backend: store.write_context_cache(
+                    game_name, backend, rows
                 ),
             )
             store.write_trial(
@@ -651,7 +704,8 @@ def _run_simple_policy(
     observation, _ = env.reset(seed=seed)
     total = 0.0
     for _ in range(config.collection.max_decisions_per_episode):
-        action = policy(observation, int(env.action_space.n))  # type: ignore[attr-defined]
+        action_count = int(env.action_space.n)  # type: ignore[attr-defined]
+        action = policy(observation, action_count)
         observation, reward, terminated, truncated, _ = env.step(action)
         total += float(reward)
         if terminated or truncated:
@@ -704,13 +758,27 @@ def evaluate(config: ProjectConfig) -> dict[str, Any]:
         pfn_scores: list[float] = []
         pfn_judgments: list[Judgment] = []
         module = game_module(config, game.name)
-        stored_queue = store.read_context_cache(game.name, game.teacher_backend).tail(
-            config.context_cache.maximum_rows
+        stored_queue = (
+            store.read_context_cache(game.name, game.teacher_backend).tail(
+                config.context_cache.maximum_rows
+            )
+            if config.context_cache.enabled
+            else pd.DataFrame()
+        )
+        frozen_actor = (
+            Actor.fit(
+                factory,
+                base_context,
+                budget=context_budget(config),
+                seed=config.runtime.seed,
+            )
+            if not config.context_cache.enabled
+            else None
         )
         for index in range(config.evaluation.final_episodes):
             seed = config.runtime.seed + 500_000 + index
             queue = ContextQueue(config.context_cache.maximum_rows, stored_queue.copy())
-            actor = Actor.fit(
+            actor = frozen_actor or Actor.fit(
                 factory,
                 base_context,
                 budget=context_budget(config),
@@ -778,7 +846,10 @@ def evaluate(config: ProjectConfig) -> dict[str, Any]:
             "improves_over_early": late_judge_score > early_judge_score,
             "cold_start_trajectory_ids": list(cold_start_ids),
         }
-    output = config.path(config.paths.data_dir) / "evaluation.json"
+    output = config.path(config.paths.data_dir) / (
+        f"evaluation_{config.learning.policy_mode}_"
+        f"{config.learning.action_selection}.json"
+    )
     atomic_json(output, report)
     return report
 
@@ -791,12 +862,14 @@ def record_video(config: ProjectConfig) -> dict[str, Any]:
     for game in config.active_games:
         base_context, cold_start_ids = _cold_start_context(config, store, game)
         judge, judge_state = _judge_for_game(config, store, game)
-        queue = ContextQueue(
-            config.context_cache.maximum_rows,
+        stored_context = (
             store.read_context_cache(game.name, game.teacher_backend).tail(
                 config.context_cache.maximum_rows
-            ),
+            )
+            if config.context_cache.enabled
+            else pd.DataFrame()
         )
+        queue = ContextQueue(config.context_cache.maximum_rows, stored_context)
         actor = Actor.fit(
             factory,
             base_context,
@@ -861,6 +934,241 @@ def record_video(config: ProjectConfig) -> dict[str, Any]:
             "judge": judgment.as_trial_columns(),
             "context_queue_rows": len(queue.rows),
             "context_additions_persisted": (config.video.persist_context_additions),
+        }
+    return results
+
+
+def _concatenate_episode_videos(
+    episode_videos: list[Path], output: Path
+) -> None:
+    """Losslessly concatenate finalized, format-identical episode MP4 files."""
+    if not episode_videos:
+        raise ValueError("At least one episode video is required")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError(
+            "ffmpeg is required to build a multi-episode video but was not found"
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    manifest = output.with_name(f".{output.stem}-{uuid.uuid4().hex}.concat.txt")
+    temporary = output.with_name(f".{output.stem}-{uuid.uuid4().hex}.partial.mp4")
+    try:
+        manifest.write_text(
+            "".join(
+                f"file '{str(path.resolve()).replace(chr(92), '/')}'\n"
+                for path in episode_videos
+            ),
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(manifest),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                "-y",
+                str(temporary),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or "unknown ffmpeg error"
+            raise RuntimeError(f"Could not concatenate episode videos: {detail}")
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise RuntimeError("ffmpeg produced an empty multi-episode video")
+        os.replace(temporary, output)
+    finally:
+        manifest.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+
+
+def record_learning_video(config: ProjectConfig) -> dict[str, Any]:
+    """Run adaptive episodes, report every score, and make one joined video."""
+    if not config.context_cache.enabled:
+        raise RuntimeError(
+            "record-learning-video requires context_cache.enabled = true"
+        )
+    if not config.video.persist_context_additions:
+        raise RuntimeError(
+            "record-learning-video requires video.persist_context_additions = true"
+        )
+
+    store = DataStore(config)
+    factory = TabPFNFactory(config)
+    run_id = uuid.uuid4().hex[:12]
+    results: dict[str, Any] = {}
+    for game in config.active_games:
+        base_context, cold_start_ids = _cold_start_context(config, store, game)
+        judge, judge_state = _judge_for_game(config, store, game)
+        stored_context = store.read_context_cache(
+            game.name, game.teacher_backend
+        ).tail(config.context_cache.maximum_rows)
+        queue = ContextQueue(config.context_cache.maximum_rows, stored_context)
+        module = game_module(config, game.name)
+        video_dir = config.path(config.paths.video_dir)
+        video_dir.mkdir(parents=True, exist_ok=True)
+        prefix = (
+            f"{config.video.name_prefix}-learning-{game.name.lower()}-{run_id}"
+        )
+        report_path = config.path(config.paths.data_dir) / (
+            f"learning_video_{game.name.lower()}_{store.policy_namespace}_{run_id}.json"
+        )
+        episode_reports: list[dict[str, Any]] = []
+        episode_videos: list[Path] = []
+
+        def write_progress(
+            status: str,
+            *,
+            joined_video: Path | None = None,
+            error: str | None = None,
+        ) -> None:
+            scores = [float(item["episode_return"]) for item in episode_reports]
+            document: dict[str, Any] = {
+                "status": status,
+                "run_id": run_id,
+                "game": game.name,
+                "policy_mode": config.learning.policy_mode,
+                "action_selection": config.learning.action_selection,
+                "configured_episodes": config.video.learning_episodes,
+                "completed_episodes": len(episode_reports),
+                "max_decisions_per_episode": config.video.max_decisions,
+                "cold_start_trajectory_ids": list(cold_start_ids),
+                "initial_context_rows": len(stored_context),
+                "final_context_rows": len(queue.rows),
+                "scores": scores,
+                "score_mean": float(np.mean(scores)) if scores else None,
+                "score_min": float(np.min(scores)) if scores else None,
+                "score_max": float(np.max(scores)) if scores else None,
+                "first_to_last_score_change": (
+                    scores[-1] - scores[0] if len(scores) >= 2 else None
+                ),
+                "episodes": episode_reports,
+                "video": str(joined_video) if joined_video is not None else None,
+                "error": error,
+            }
+            atomic_json(report_path, document)
+
+        write_progress("running")
+        joined_video = video_dir / f"{prefix}.mp4"
+        try:
+            for episode_index in range(config.video.learning_episodes):
+                seed = config.video.seed + episode_index
+                actor = Actor.fit(
+                    factory,
+                    base_context,
+                    budget=context_budget(config),
+                    seed=config.runtime.seed,
+                    additions=queue.rows,
+                    minimum_base_rows=config.context_cache.minimum_cold_start_rows,
+                )
+                episode_prefix = f"{prefix}-episode-{episode_index:03d}"
+                before = set(video_dir.glob(f"{episode_prefix}*.mp4"))
+                base_env = build_env(
+                    game.env_id, config.atari, config.runtime, render=True
+                )
+                env = RecordVideo(
+                    base_env,
+                    video_folder=str(video_dir),
+                    episode_trigger=lambda episode: episode == 0,
+                    video_length=config.video.max_decisions,
+                    name_prefix=episode_prefix,
+                    fps=config.video.fps,
+                )
+                context_rows_before = len(queue.rows)
+                result = _run_actor(
+                    config,
+                    game,
+                    actor,
+                    seed=seed,
+                    factory=factory,
+                    base_context=base_context,
+                    queue=queue,
+                    judge=judge,
+                    judge_state=judge_state,
+                    relevance_filter=module.relevance_filter,
+                    persist_queue=lambda rows,
+                    game_name=game.name,
+                    backend=game.teacher_backend: store.write_context_cache(
+                        game_name, backend, rows
+                    ),
+                    environment=env,
+                    decision_limit=config.video.max_decisions,
+                )
+                created = sorted(
+                    set(video_dir.glob(f"{episode_prefix}*.mp4")) - before,
+                    key=lambda path: path.stat().st_mtime,
+                )
+                if not created:
+                    raise RuntimeError(
+                        f"RecordVideo did not produce episode {episode_index} for "
+                        f"{game.name}"
+                    )
+                episode_video = created[-1]
+                episode_videos.append(episode_video)
+                judgment = judge.judge(result.outcome(game.name), judge_state)
+                episode_report = {
+                    "episode_index": episode_index,
+                    "seed": seed,
+                    "episode_return": result.episode_return,
+                    "decisions": result.episode_length,
+                    "positive_reward_events": result.positive_reward_events,
+                    "initial_lives": result.initial_lives,
+                    "final_lives": result.final_lives,
+                    "terminated": result.terminated,
+                    "truncated": result.truncated,
+                    "context_rows_before": context_rows_before,
+                    "context_rows_after": len(queue.rows),
+                    "judge": judgment.as_trial_columns(),
+                    "episode_video": str(episode_video),
+                }
+                episode_reports.append(episode_report)
+                store.write_trial(
+                    game.name,
+                    game.teacher_backend,
+                    f"learning-video-{run_id}-{episode_index:06d}",
+                    {
+                        "seed": seed,
+                        "learning_video_run_id": run_id,
+                        "learning_video_episode_index": episode_index,
+                        "cold_start_trajectory_ids": json.dumps(cold_start_ids),
+                        **result.outcome(game.name).as_trial_columns(),
+                        **judgment.as_trial_columns(),
+                    },
+                    phase="learning_video",
+                )
+                write_progress("running")
+
+            _concatenate_episode_videos(episode_videos, joined_video)
+            if not config.video.retain_learning_episode_videos:
+                for episode_video in episode_videos:
+                    episode_video.unlink()
+                for episode_report in episode_reports:
+                    episode_report["episode_video"] = None
+            write_progress("complete", joined_video=joined_video)
+        except BaseException as error:
+            write_progress("failed", error=f"{type(error).__name__}: {error}")
+            raise
+        results[game.name] = {
+            "run_id": run_id,
+            "video": str(joined_video),
+            "report": str(report_path),
+            "episode_scores": [
+                report["episode_return"] for report in episode_reports
+            ],
+            "episodes": len(episode_reports),
+            "final_context_rows": len(queue.rows),
         }
     return results
 

@@ -16,6 +16,12 @@ def test_default_config_enables_only_beamrider() -> None:
     assert config.video.max_decisions == 1024
     assert config.runtime.cpu_context_rows == 4000
     assert config.runtime.cuda_context_rows == 10000
+    assert config.learning.policy_mode == "outcome_conditioned"
+    assert config.learning.action_selection == "probability_sample"
+    assert config.learning.epsilon_sample_probability == 0.30
+    assert config.context_cache.enabled
+    assert config.video.learning_episodes == 10
+    assert config.video.retain_learning_episode_videos
 
 
 def test_unknown_enabled_game_is_rejected() -> None:

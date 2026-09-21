@@ -18,16 +18,36 @@ STATE_META_COLUMNS = (
     "first_step",
 )
 DESIRED_SYMBOLIC_LABEL = "desired_symbolic_label"
-ACTION_FEATURE_COLUMNS = (
-    RAM_COLUMNS + DELTA_COLUMNS + STATE_META_COLUMNS + (DESIRED_SYMBOLIC_LABEL,)
-)
-ACTION_CATEGORICAL_COLUMNS = (
-    "previous_action",
-    "first_step",
+STATE_FEATURE_COLUMNS = RAM_COLUMNS + DELTA_COLUMNS + STATE_META_COLUMNS
+STATE_CATEGORICAL_COLUMNS = ("previous_action", "first_step")
+OUTCOME_CONDITIONED_FEATURE_COLUMNS = STATE_FEATURE_COLUMNS + (
     DESIRED_SYMBOLIC_LABEL,
 )
+OUTCOME_CONDITIONED_CATEGORICAL_COLUMNS = STATE_CATEGORICAL_COLUMNS + (
+    DESIRED_SYMBOLIC_LABEL,
+)
+# Backwards-compatible aliases for stored row construction and callers that need
+# the superset of every available actor feature.
+ACTION_FEATURE_COLUMNS = OUTCOME_CONDITIONED_FEATURE_COLUMNS
+ACTION_CATEGORICAL_COLUMNS = OUTCOME_CONDITIONED_CATEGORICAL_COLUMNS
 ACTION_TARGET_COLUMN = "executed_action"
-SYMBOLIC_LABEL_SCHEMA = "symbolic_teacher_window16_online_window8_v5"
+SYMBOLIC_LABEL_SCHEMA = "symbolic_teacher_rolling16_online_window8_v6"
+
+
+def actor_feature_columns(policy_mode: str) -> tuple[str, ...]:
+    if policy_mode == "behavior_cloning":
+        return STATE_FEATURE_COLUMNS
+    if policy_mode == "outcome_conditioned":
+        return OUTCOME_CONDITIONED_FEATURE_COLUMNS
+    raise ValueError(f"Unknown policy mode: {policy_mode}")
+
+
+def actor_categorical_columns(policy_mode: str) -> tuple[str, ...]:
+    if policy_mode == "behavior_cloning":
+        return STATE_CATEGORICAL_COLUMNS
+    if policy_mode == "outcome_conditioned":
+        return OUTCOME_CONDITIONED_CATEGORICAL_COLUMNS
+    raise ValueError(f"Unknown policy mode: {policy_mode}")
 
 
 class RamFeatureExtractor(Protocol):
