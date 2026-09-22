@@ -30,6 +30,8 @@ from tfm4atari.environment import (
 from tfm4atari.features import (
     ACTION_TARGET_COLUMN,
     DESIRED_SYMBOLIC_LABEL,
+    OUTCOME_CATEGORY_TARGET,
+    OUTCOME_SCORE_TARGET,
     SYMBOLIC_LABEL_SCHEMA,
     DefaultRamFeatureExtractor,
     actor_feature_columns,
@@ -134,19 +136,26 @@ def fetch_teachers(config: ProjectConfig) -> dict[str, str]:
 def prepare_tabpfn(config: ProjectConfig) -> dict[str, Any]:
     """Download/license-check TabPFN 3.5 and execute a tiny real inference."""
     feature_columns = ("feature_a", "feature_b")
-    classifier = TabPFNFactory(config).classifier(feature_columns)
     x = pd.DataFrame({"feature_a": [0.0, 0.2, 0.8, 1.0], "feature_b": [1, 1, 0, 0]})
-    y = pd.Series([False, False, True, True], name="success")
-    classifier.fit(x, y)
-    probabilities = classifier.predict_proba(
-        pd.DataFrame({"feature_a": [0.1, 0.9], "feature_b": [1, 0]})
-    )
-    return {
+    query = pd.DataFrame({"feature_a": [0.1, 0.9], "feature_b": [1, 0]})
+    factory = TabPFNFactory(config)
+    report: dict[str, Any] = {
         "device": resolved_device(config),
         "cache_dir": str(config.path(config.tabpfn.cache_dir)),
-        "classes": [bool(value) for value in classifier.classes_],
-        "probabilities": probabilities.tolist(),
+        "policy_mode": config.learning.policy_mode,
     }
+    if config.learning.policy_mode == "outcome_prediction_regression":
+        regressor = factory.regressor(feature_columns)
+        regressor.fit(x, pd.Series([-1.0, -0.5, 0.5, 1.0], name="outcome"))
+        report["task"] = "regression"
+        report["predictions"] = np.asarray(regressor.predict(query)).tolist()
+    else:
+        classifier = factory.classifier(feature_columns)
+        classifier.fit(x, pd.Series([False, False, True, True], name="success"))
+        report["task"] = "classification"
+        report["classes"] = [bool(value) for value in classifier.classes_]
+        report["probabilities"] = classifier.predict_proba(query).tolist()
+    return report
 
 
 def _load_teacher(config: ProjectConfig, game: GameConfig) -> TeacherPolicy:
@@ -167,6 +176,11 @@ def _cold_start_context(
     return pd.concat(frames, ignore_index=True), ids
 
 
+def _episode_progress_feature(config: ProjectConfig, decisions: int) -> float:
+    """Use the same time scale for teacher, learning, and capped playback."""
+    return decisions / config.features.episode_progress_reference_decisions
+
+
 def _label_symbolic_interval(
     config: ProjectConfig, game: GameConfig, actions: pd.DataFrame
 ) -> pd.DataFrame:
@@ -182,8 +196,53 @@ def _label_symbolic_interval(
         )
         labeled["symbolic_label"] = np.int8(label)
     labeled[DESIRED_SYMBOLIC_LABEL] = labeled["symbolic_label"].astype("int8")
+    categories, scores, _ = _rolling_outcome_targets(
+        actions,
+        horizon=len(actions),
+        discount=config.learning.outcome_score_discount,
+    )
+    labeled[OUTCOME_CATEGORY_TARGET] = categories
+    labeled[OUTCOME_SCORE_TARGET] = scores
     labeled["label_source"] = "symbolic_action_judge"
     return labeled
+
+
+def _rolling_outcome_targets(
+    actions: pd.DataFrame,
+    *,
+    horizon: int,
+    discount: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return per-action categorical and continuous forward outcomes."""
+    if horizon < 1:
+        raise ValueError("Outcome horizon must be positive")
+    if not 0.0 < discount <= 1.0:
+        raise ValueError("Outcome discount must be in (0, 1]")
+    if actions.empty:
+        return (
+            np.asarray([], dtype=np.int8),
+            np.asarray([], dtype=np.float32),
+            np.asarray([], dtype=np.int64),
+        )
+    rewards = actions["observed_reward"].to_numpy(dtype=np.float64) > 0
+    deaths = (
+        actions["lives_after"].to_numpy(dtype=np.int64)
+        < actions["lives_before"].to_numpy(dtype=np.int64)
+    )
+    signals = np.where(deaths, -1.0, np.where(rewards, 1.0, 0.0))
+    sizes = np.minimum(horizon, len(actions) - np.arange(len(actions)))
+    categories = np.zeros(len(actions), dtype=np.int8)
+    scores = np.zeros(len(actions), dtype=np.float32)
+    for start, size in enumerate(sizes):
+        stop = start + int(size)
+        categories[start] = (
+            -1 if deaths[start:stop].any() else int(rewards[start:stop].any())
+        )
+        weights = np.power(discount, np.arange(size, dtype=np.float64))
+        scores[start] = np.float32(
+            np.dot(weights, signals[start:stop]) / weights.sum()
+        )
+    return categories, scores, sizes
 
 
 def _label_teacher_symbolic_rolling(
@@ -193,31 +252,16 @@ def _label_teacher_symbolic_rolling(
     if actions.empty:
         return actions.copy()
     capacity = config.context_cache.teacher_judgment_capacity
-    # This is the vectorized equivalent of applying the existing interval
-    # labeler to actions.iloc[start:start + capacity] and retaining its first
-    # row. It deliberately preserves death precedence and the exact binary
-    # reward/life-loss signals used by online cache batches.
-    rewards = (actions["observed_reward"].to_numpy() > 0).astype(np.int64)
-    deaths = (
-        actions["lives_after"].to_numpy()
-        < actions["lives_before"].to_numpy()
-    ).astype(np.int64)
-
-    def future_counts(values: np.ndarray) -> np.ndarray:
-        padded = np.pad(values, (0, capacity), constant_values=0)
-        cumulative = np.concatenate(([0], np.cumsum(padded, dtype=np.int64)))
-        starts = np.arange(len(values))
-        return cumulative[starts + capacity] - cumulative[starts]
-
-    reward_ahead = future_counts(rewards) > 0
-    death_ahead = future_counts(deaths) > 0
-    labels = np.where(death_ahead, -1, np.where(reward_ahead, 1, 0)).astype(
-        np.int8
+    labels, scores, sizes = _rolling_outcome_targets(
+        actions,
+        horizon=capacity,
+        discount=config.learning.outcome_score_discount,
     )
-    sizes = np.minimum(capacity, len(actions) - np.arange(len(actions)))
     labeled = actions.copy().reset_index(drop=True)
     labeled["symbolic_label"] = labels
     labeled[DESIRED_SYMBOLIC_LABEL] = labels
+    labeled[OUTCOME_CATEGORY_TARGET] = labels
+    labeled[OUTCOME_SCORE_TARGET] = scores
     labeled["label_source"] = "symbolic_action_judge_rolling"
     labeled["rolling_window_end_step"] = (
         labeled["step"].to_numpy()[np.arange(len(labeled)) + sizes - 1]
@@ -299,9 +343,7 @@ def collect(
                     previous_action=previous_action,
                     previous_reward=previous_reward,
                     lives=lives_before,
-                    episode_progress=(
-                        decisions / config.collection.max_decisions_per_episode
-                    ),
+                    episode_progress=_episode_progress_feature(config, decisions),
                     desired_symbolic_label=0,
                 )
                 observation, reward, terminated, truncated, _ = env.step(teacher_action)
@@ -499,7 +541,7 @@ def _run_actor(
             previous_action=previous_action,
             previous_reward=previous_reward,
             lives=current_lives(env),
-            episode_progress=decisions / limit,
+            episode_progress=_episode_progress_feature(config, decisions),
         )
         executed_features = actor.extractor.state_features(
             ram,
@@ -507,7 +549,7 @@ def _run_actor(
             previous_action=previous_action,
             previous_reward=previous_reward,
             lives=lives_before,
-            episode_progress=decisions / limit,
+            episode_progress=_episode_progress_feature(config, decisions),
             desired_symbolic_label=0,
         )
         _, reward, terminated, truncated, _ = env.step(action)

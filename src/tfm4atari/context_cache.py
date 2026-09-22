@@ -10,6 +10,8 @@ QUEUE_ID_COLUMNS = ("online_trajectory_id", "step", "executed_action")
 QUEUE_REQUIRED_COLUMNS = QUEUE_ID_COLUMNS + (
     "symbolic_label",
     "desired_symbolic_label",
+    "rolling_outcome_category",
+    "rolling_outcome_score",
     "label_source",
     "judged_window_id",
 )

@@ -3,11 +3,13 @@ import pytest
 
 from tfm4atari.config import BeamRiderCacheConfig, load_config
 from tfm4atari.context_cache import ContextQueue
+from tfm4atari.features import OUTCOME_CATEGORY_TARGET, OUTCOME_SCORE_TARGET
 from tfm4atari.games.beamrider import (
     BeamRiderRelevanceFilter,
     label_beamrider_interval,
 )
 from tfm4atari.pipeline import (
+    _episode_progress_feature,
     _label_symbolic_interval,
     _label_teacher_symbolic_rolling,
 )
@@ -24,6 +26,8 @@ def _rows() -> pd.DataFrame:
             "lives_after": [3, 3, 3, 2],
             "symbolic_label": [0, 1, 1, -1],
             "desired_symbolic_label": [0, 1, 1, -1],
+            "rolling_outcome_category": [0, 1, 1, -1],
+            "rolling_outcome_score": [0.0, 0.5, 1.0, -1.0],
             "label_source": ["judge"] * 4,
             "judged_window_id": ["window"] * 4,
         }
@@ -48,6 +52,30 @@ def test_teacher_symbolic_rolling_keeps_every_action() -> None:
     assert len(labeled) == len(_rows())
 
 
+def test_teacher_and_online_windows_match_by_default() -> None:
+    config = load_config()
+    assert (
+        config.context_cache.teacher_judgment_capacity
+        == config.context_cache.judgment_capacity
+    )
+
+
+def test_episode_progress_feature_is_independent_of_episode_cap() -> None:
+    config = load_config()
+    short_cap = config.model_copy(
+        update={
+            "collection": config.collection.model_copy(
+                update={"max_decisions_per_episode": 2048}
+            ),
+            "video": config.video.model_copy(update={"max_decisions": 1024}),
+        }
+    )
+    assert _episode_progress_feature(config, 1024) == _episode_progress_feature(
+        short_cap, 1024
+    )
+    assert _episode_progress_feature(short_cap, 1024) == pytest.approx(1024 / 27000)
+
+
 def test_teacher_uses_overlapping_forward_credit_windows() -> None:
     config = load_config()
     config = config.model_copy(
@@ -62,6 +90,10 @@ def test_teacher_uses_overlapping_forward_credit_windows() -> None:
     rows["lives_after"] = rows["lives_before"]
     labeled = _label_teacher_symbolic_rolling(config, config.active_games[0], rows)
     assert labeled["symbolic_label"].tolist() == [0, 1, 1, 0]
+    assert labeled[OUTCOME_CATEGORY_TARGET].tolist() == [0, 1, 1, 0]
+    assert labeled[OUTCOME_SCORE_TARGET].between(-1.0, 1.0).all()
+    assert labeled[OUTCOME_SCORE_TARGET].iloc[1] > 0.0
+    assert labeled[OUTCOME_SCORE_TARGET].iloc[2] > 0.0
     assert labeled["rolling_window_end_step"].tolist() == [1, 2, 3, 3]
     assert labeled["rolling_window_size"].tolist() == [2, 2, 2, 1]
 

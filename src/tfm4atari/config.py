@@ -45,6 +45,11 @@ class AtariConfig(StrictModel):
     full_action_space: bool = False
 
 
+class FeaturesConfig(StrictModel):
+    # This is a feature scale, not the current collection or playback limit.
+    episode_progress_reference_decisions: int = Field(27000, ge=1)
+
+
 class CollectionConfig(StrictModel):
     episodes_per_game: int = Field(2, ge=2)
     sample_stride: int = Field(1, ge=1)
@@ -54,10 +59,17 @@ class CollectionConfig(StrictModel):
 
 class LearningConfig(StrictModel):
     episodes: int = Field(100, ge=1)
-    policy_mode: Literal["behavior_cloning", "outcome_conditioned"] = (
-        "outcome_conditioned"
+    policy_mode: Literal[
+        "behavior_cloning",
+        "outcome_conditioned",
+        "outcome_prediction_categorical",
+        "outcome_prediction_regression",
+    ] = (
+        "outcome_prediction_categorical"
     )
     desired_symbolic_label: Literal[-1, 0, 1] = 1
+    outcome_score_discount: float = Field(0.90, gt=0.0, le=1.0)
+    outcome_sampling_temperature: float = Field(0.25, gt=0.0)
     action_selection: Literal[
         "greedy", "probability_sample", "epsilon_sample"
     ] = "probability_sample"
@@ -90,7 +102,7 @@ class BeamRiderCacheConfig(StrictModel):
 
 class ContextCacheConfig(StrictModel):
     enabled: bool = True
-    teacher_judgment_capacity: int = Field(16, ge=1)
+    teacher_judgment_capacity: int = Field(8, ge=1)
     judgment_capacity: int = Field(64, ge=1)
     refit_every_judged_batches: int = Field(4, ge=1)
     maximum_rows: int = Field(4000, ge=2)
@@ -143,6 +155,7 @@ class ProjectConfig(StrictModel):
     paths: PathsConfig
     runtime: RuntimeConfig
     atari: AtariConfig
+    features: FeaturesConfig
     collection: CollectionConfig
     learning: LearningConfig
     trajectory_judges: TrajectoryJudgesConfig

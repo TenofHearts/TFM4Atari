@@ -160,8 +160,10 @@ def test_learning_video_carries_context_and_checkpoints_scores(
                         "step": 0,
                         "executed_action": 1,
                         "symbolic_label": 1,
-                        "desired_symbolic_label": 1,
-                        "label_source": "test",
+                            "desired_symbolic_label": 1,
+                            "rolling_outcome_category": 1,
+                            "rolling_outcome_score": 1.0,
+                            "label_source": "test",
                         "judged_window_id": f"window-{episode_index}",
                     }
                 ]

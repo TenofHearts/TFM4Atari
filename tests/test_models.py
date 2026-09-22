@@ -5,7 +5,10 @@ from tfm4atari.config import load_config
 from tfm4atari.features import (
     ACTION_FEATURE_COLUMNS,
     ACTION_TARGET_COLUMN,
+    CANDIDATE_ACTION_COLUMN,
     DESIRED_SYMBOLIC_LABEL,
+    OUTCOME_CATEGORY_TARGET,
+    OUTCOME_SCORE_TARGET,
 )
 from tfm4atari.models import Actor, stratified_context
 
@@ -20,6 +23,16 @@ class RecordingClassifier:
     def predict_proba(self, x):
         self.query = x.copy()
         return np.tile([0.5, 0.5], (len(x), 1))
+
+
+class RecordingRegressor:
+    def fit(self, x, y):
+        self.x = x.copy()
+        self.y = y.copy()
+
+    def predict(self, x):
+        self.query = x.copy()
+        return x[CANDIDATE_ACTION_COLUMN].to_numpy(dtype=float) / 2.0
 
 
 class RecordingFactory:
@@ -48,12 +61,20 @@ class RecordingFactory:
         self.model = RecordingClassifier()
         return self.model
 
+    def regressor(self, feature_columns, categorical_columns=()):
+        self.feature_columns = feature_columns
+        self.categorical_columns = categorical_columns
+        self.model = RecordingRegressor()
+        return self.model
+
 
 def _action_rows(count: int, marker: int) -> pd.DataFrame:
     rows = pd.DataFrame(0, index=range(count), columns=ACTION_FEATURE_COLUMNS)
     rows["step"] = range(count)
     rows[ACTION_TARGET_COLUMN] = [index % 2 for index in range(count)]
     rows[DESIRED_SYMBOLIC_LABEL] = [index % 3 - 1 for index in range(count)]
+    rows[OUTCOME_CATEGORY_TARGET] = [index % 3 - 1 for index in range(count)]
+    rows[OUTCOME_SCORE_TARGET] = [index % 3 / 2 - 0.5 for index in range(count)]
     rows["ram_000"] = marker
     return rows
 
@@ -123,6 +144,44 @@ def test_outcome_conditioned_actor_queries_for_success_label_one() -> None:
         episode_progress=0.0,
     )
     assert factory.model.query[DESIRED_SYMBOLIC_LABEL].tolist() == [1]
+
+
+def test_categorical_outcome_actor_scores_every_candidate_action() -> None:
+    factory = RecordingFactory(
+        policy_mode="outcome_prediction_categorical", action_selection="greedy"
+    )
+    actor = Actor.fit(factory, _action_rows(10, marker=1), budget=10, seed=1)
+    actor.choose_action(
+        np.zeros(128, dtype=np.uint8),
+        None,
+        action_count=3,
+        previous_action=-1,
+        previous_reward=0.0,
+        lives=3,
+        episode_progress=0.0,
+    )
+    assert factory.model.y.name == OUTCOME_CATEGORY_TARGET
+    assert factory.model.query[CANDIDATE_ACTION_COLUMN].tolist() == [0, 1, 2]
+    assert DESIRED_SYMBOLIC_LABEL not in factory.model.query
+
+
+def test_regression_outcome_actor_selects_highest_scoring_action() -> None:
+    factory = RecordingFactory(
+        policy_mode="outcome_prediction_regression", action_selection="greedy"
+    )
+    actor = Actor.fit(factory, _action_rows(10, marker=1), budget=10, seed=1)
+    action = actor.choose_action(
+        np.zeros(128, dtype=np.uint8),
+        None,
+        action_count=3,
+        previous_action=-1,
+        previous_reward=0.0,
+        lives=3,
+        episode_progress=0.0,
+    )
+    assert factory.model.y.name == OUTCOME_SCORE_TARGET
+    assert factory.model.query[CANDIDATE_ACTION_COLUMN].tolist() == [0, 1, 2]
+    assert action == 2
 
 
 def test_probability_sampling_is_seeded_and_uses_model_probabilities() -> None:

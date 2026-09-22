@@ -1,10 +1,11 @@
 # TFM4Atari
 
 TFM4Atari uses TabPFN 3.5 as an Atari policy. Pretrained RL Zoo teachers supply
-cold-start trajectories and executed actions. One TabPFN classifier learns from
-two complete teacher trajectories in a single combined original context. The
-configured policy uses rolling symbolic outcome conditioning and probability
-sampling; frozen behavior cloning remains available as the comparison mode.
+cold-start trajectories and executed actions. TabPFN learns from two complete
+teacher trajectories in a single combined original context. The configured
+policy evaluates every legal action with a categorical rolling-outcome model;
+continuous outcome regression, outcome-conditioned imitation, and frozen
+behavior cloning remain available as comparison modes.
 
 The default configuration enables **BeamRider only**. The other six benchmark
 games are defined but are not collected or tested until added to
@@ -54,7 +55,9 @@ commands resume from completed work.
 
 - The DQN sees RL Zoo-compatible stacked 84×84 grayscale frames.
 - TabPFN sees 128 RAM bytes, signed one-step RAM deltas, and compact action/game
-  state fields. It never receives pixels.
+  state fields. It never receives pixels. The `episode_progress` input uses the
+  fixed `features.episode_progress_reference_decisions` scale, independent of
+  collection, learning, and video stopping limits.
 - Exactly two naturally completed teacher episodes form the cold start.
   Incomplete episodes and episodes assigned any other collection role cannot
   enter this context. Every executed action from both teacher episodes is kept;
@@ -63,18 +66,25 @@ commands resume from completed work.
   expose action values, while PPO exposes action probabilities as preferences.
   Stored cold-start trajectories and RL queues are isolated by backend.
 - Every teacher action receives a rolling label from its overlapping forward
-  16-action window. The existing symbolic interval rule is reused unchanged:
+  8-action window, matching the online outcome horizon. The existing symbolic
+  interval rule is reused unchanged:
   `+1` if the window contains reward, `-1` if it contains death/punishment, and
   `0` otherwise, with death/punishment taking precedence. Teacher
   Q-values/probabilities are not used as context labels.
-- Online experience, when enabled, retains completed 8-action cache batches and
-  uses the same reward/death/neutral symbolic rule.
+- Online experience, when enabled, retains completed 8-action cache batches.
+  The legacy symbolic label is shared by the batch, while the direct outcome
+  targets are assigned per action from the remaining suffix of that batch.
 - `learning.policy_mode = "behavior_cloning"` omits the symbolic label during
   fit and inference. `"outcome_conditioned"` includes the rolling label during
   fit and requests `learning.desired_symbolic_label` during inference.
-- `learning.action_selection` selects deterministic greedy actions, samples
-  directly from predicted action probabilities, or applies configured epsilon
-  sampling. Every stochastic mode is reset from the reproducible episode seed.
+- `"outcome_prediction_categorical"` makes the executed action an input and
+  predicts `-1`, `0`, or `+1`; each legal action is scored by its expected class
+  value. `"outcome_prediction_regression"` instead predicts a continuous score
+  in `[-1, 1]`. The score is a normalized discounted mean of future event
+  signals, where reward is `+1`, life loss is `-1`, and no event is `0`.
+- `learning.action_selection` selects the highest-scoring action, samples from
+  temperature-scaled action scores, or applies configured epsilon sampling.
+  Every stochastic mode is reset from the reproducible episode seed.
 - Online adaptation is enabled for the configured multi-episode learning-video
   experiment. Set `context_cache.enabled = false` for frozen teacher-context
   comparisons where self-generated actions must not affect later decisions.
